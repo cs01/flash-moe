@@ -1439,7 +1439,8 @@ def split_layer_entries(entries):
 def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_index, model_path,
                                preload_topk=0, cache_gb=20.0, profile=False,
                                use_pread=False, pread_index=None, pread_fds=None,
-                               use_cext=False, batch_experts=False):
+                               use_cext=False, batch_experts=False,
+                               top_k_override=0):
     """Generate tokens with selective expert loading for MoE models.
 
     At startup: pre-load all non-expert weights (~2.3GB) for all layers into DRAM.
@@ -1515,8 +1516,10 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     # === LRU cache for expert weight slices ===
     # Size = num_layers * active_experts_per_token * N tokens of history.
     # Cap total cache memory at 20GB to leave headroom for OS on 48GB machine.
-    active_experts = lm.args.num_experts_per_tok
+    active_experts = lm.args.num_experts_per_tok if top_k_override <= 0 else min(lm.args.num_experts_per_tok, top_k_override)
     cache_entries = num_layers * active_experts * 8
+    if top_k_override > 0:
+        print(f"  [top-k override] Using {active_experts} experts/token (model default: {lm.args.num_experts_per_tok})")
 
     # Estimate per-entry bytes to enforce memory cap
     hidden = lm.args.hidden_size
@@ -1638,7 +1641,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             h_post = layer.post_attention_layernorm(h_mid)
             gates = layer.mlp.gate(h_post)
             gates = mx.softmax(gates, axis=-1, precise=True)
-            k = layer.mlp.top_k
+            k = layer.mlp.top_k if top_k_override <= 0 else min(layer.mlp.top_k, top_k_override)
             inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
             scores = mx.take_along_axis(gates, inds, axis=-1)
             scores = scores / scores.sum(axis=-1, keepdims=True)
@@ -3445,6 +3448,9 @@ def main():
                              "Merges attention+routing into one sync and skips the separate "
                              "expert weight eval, cutting per-layer syncs from 4 to 2. "
                              "Only affects offload_selective mode. Output is identical.")
+    parser.add_argument("--top-k", type=int, default=0,
+                        help="Override number of active experts per token (0 = use model default). "
+                             "Lower values reduce I/O at the cost of quality. Model default is 10.")
     args = parser.parse_args()
 
     # Validate --cache-gb range
@@ -3623,7 +3629,8 @@ def main():
                                             pread_index=pread_index,
                                             pread_fds=pread_fds,
                                             use_cext=args.use_cext,
-                                            batch_experts=args.batch_experts)
+                                            batch_experts=args.batch_experts,
+                                            top_k_override=args.top_k)
     elif args.mode in ("offload", "offload_lazy"):
         # Offload mode: explicit per-layer load -> compute -> clear cycle.
         # Only way to run models larger than DRAM without OS thrashing.
