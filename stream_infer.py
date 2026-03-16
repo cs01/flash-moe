@@ -1596,6 +1596,24 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     # Try to load packed expert files (1 contiguous read per expert, 1.9x faster I/O)
     packed_layout, packed_fds, packed_layers = load_packed_experts(model_path)
 
+    # mmap packed layer files for zero-copy access (60 GB/s when page-cached!)
+    import mmap as _mmap_mod
+    packed_mmaps = {}
+    if packed_fds:
+        for layer_idx, fd in packed_fds.items():
+            packed_mmaps[layer_idx] = _mmap_mod.mmap(fd, 0, prot=_mmap_mod.PROT_READ)
+
+    # Precompute packed component lookup for hot path
+    _packed_comps = None
+    if packed_layout is not None:
+        _packed_comps = []
+        for comp in packed_layout["components"]:
+            parts = comp["name"].split(".")
+            np_dtype, _ = _PREAD_NP_DTYPE[comp["dtype"]]
+            is_bf16 = comp["dtype"] == "BF16"
+            _packed_comps.append((parts[0], parts[1], comp["offset"], comp["size"],
+                                  np_dtype, tuple(comp["shape"]), is_bf16))
+
     if no_expert_cache:
         print(f"  [no-expert-cache] Skipping ExpertCache — OS page cache handles all expert reads.")
         print(f"  [no-expert-cache] All {active_experts} active experts read from safetensors per layer per token.")
@@ -1847,28 +1865,21 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                             header_cache[filepath] = parse_safetensors_header(filepath)
 
                     # Read only unpinned experts from disk
-                    if packed_layout is not None and i in packed_layers:
+                    if _packed_comps is not None and i in packed_layers:
                         # PACKED PATH: separated I/O (threaded) then conversion (serial)
-                        # Phase 1: parallel pread — GIL released during I/O
                         packed_fd = packed_fds[i]
                         es = packed_layout["expert_size"]
                         def _just_read(eidx):
                             return eidx, os.pread(packed_fd, es, eidx * es)
                         raw_buffers = list(_io_pool.map(_just_read, unpinned_list))
-                        # Phase 2: serial conversion — no I/O, just CPU
                         for eidx, raw in raw_buffers:
                             mv = memoryview(raw)
                             attrs = {}
-                            for comp in packed_layout["components"]:
-                                parts = comp["name"].split(".")
-                                chunk = mv[comp["offset"]:comp["offset"]+comp["size"]]
-                                np_dtype, _ = _PREAD_NP_DTYPE[comp["dtype"]]
-                                np_arr = np.frombuffer(chunk, dtype=np_dtype).reshape(comp["shape"])
-                                if comp["dtype"] == 'BF16':
-                                    np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
-                                    attrs[(parts[0], parts[1])] = mx.array(np_f32).astype(mx.bfloat16)
-                                else:
-                                    attrs[(parts[0], parts[1])] = mx.array(np_arr)
+                            for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
+                                arr = mx.array(np.frombuffer(mv[off:off+sz], dtype=npdtype).reshape(shape))
+                                if is_bf16:
+                                    arr = arr.view(mx.bfloat16)
+                                attrs[(proj, attr)] = arr
                             all_expert_attrs[eidx] = attrs
                             token_io_bytes += es
                             token_io_seeks += 1
@@ -2098,17 +2109,28 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
                 h = h_mid + y
 
-                # Single eval: evaluates stacked weights + gather_qmm + shared expert + residual
-                if profile:
-                    t_compute_eval = time.perf_counter()
-                    mx.eval(h)
-                    t_compute_eval_done = time.perf_counter()
-                    layer_compute_eval_ms = (t_compute_eval_done - t_compute_eval) * 1000
-                    layer_compute_ms = (t_compute_eval - t_moe) * 1000
-                    token_moe_compute_time += (t_compute_eval_done - t_moe)
+                # Lazy eval: skip explicit sync, let computation accumulate.
+                # The next layer's mx.eval(h_mid, inds) will evaluate this layer's
+                # expert computation as part of its dependency chain. Eval every 4
+                # layers to prevent unbounded graph growth.
+                if i % 4 == 3 or i == num_layers - 1:
+                    if profile:
+                        t_compute_eval = time.perf_counter()
+                        mx.eval(h)
+                        t_compute_eval_done = time.perf_counter()
+                        layer_compute_eval_ms = (t_compute_eval_done - t_compute_eval) * 1000
+                        layer_compute_ms = (t_compute_eval - t_moe) * 1000
+                        token_moe_compute_time += (t_compute_eval_done - t_moe)
+                    else:
+                        mx.eval(h)
+                        token_moe_compute_time += time.time() - t_moe
                 else:
-                    mx.eval(h)
-                    token_moe_compute_time += time.time() - t_moe
+                    if profile:
+                        layer_compute_eval_ms = 0.0
+                        layer_compute_ms = (time.perf_counter() - t_moe) * 1000
+                        token_moe_compute_time += time.perf_counter() - t_moe
+                    else:
+                        token_moe_compute_time += time.time() - t_moe
             else:
                 # Default path: eval expert weights separately, then compute
                 # Force-eval the assembled expert weight tensors
