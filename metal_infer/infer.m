@@ -5499,6 +5499,23 @@ static int extract_max_tokens(const char *buf, int default_val) {
     return atoi(p + 1);
 }
 
+// Extract "session_id" string from JSON body. Copies into out_buf (max out_size).
+// Returns 1 if found, 0 if missing.
+static int extract_session_id(const char *buf, char *out_buf, int out_size) {
+    const char *p = strstr(buf, "\"session_id\"");
+    if (!p) return 0;
+    p += 12; // skip "session_id"
+    while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    if (*p != '"') return 0;
+    p++; // skip opening quote
+    int i = 0;
+    while (*p && *p != '"' && i < out_size - 1) {
+        out_buf[i++] = *p++;
+    }
+    out_buf[i] = '\0';
+    return i > 0 ? 1 : 0;
+}
+
 // Write a full HTTP response string to fd
 static void http_write(int fd, const char *data, int len) {
     int sent = 0;
@@ -5567,6 +5584,22 @@ static const char *CORS_RESPONSE =
 // Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
 static PromptTokens *tokenize_user_turn(const char *user_content) {
     const char *prefix = "<|im_start|>user\n";
+    const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
+
+    size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
+    char *prompt = malloc(prompt_len);
+    if (!prompt) return NULL;
+    snprintf(prompt, prompt_len, "%s%s%s", prefix, user_content, suffix);
+    PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
+    free(prompt);
+    return pt;
+}
+
+// Tokenize a continuation turn for session caching.
+// Prefixes with <|im_end|>\n to close the previous assistant turn, then the new user turn.
+// Used when the KV cache already contains the prior conversation state.
+static PromptTokens *tokenize_continuation_turn(const char *user_content) {
+    const char *prefix = "<|im_end|>\n<|im_start|>user\n";
     const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
 
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
@@ -5775,6 +5808,12 @@ static void serve_loop(
     }
     int sys_prompt_len = sys_pos;  // number of tokens in system prompt cache
 
+    // ---- Session state: track one active conversation session ----
+    // The KV caches + linear attention state ARE the session.
+    // We just track whether to restore from snapshot (new session) or continue (same session).
+    char active_session_id[64] = {0};
+    int session_pos = 0;  // RoPE position after last generation for the active session
+
     for (;;) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -5850,15 +5889,30 @@ static void serve_loop(
             int max_gen = extract_max_tokens(body, 8192);
             if (max_gen > 32768) max_gen = 32768;
 
+            // ---- Session caching: check if we can continue an existing session ----
+            char req_session_id[64] = {0};
+            int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
+            int is_continuation = (has_session &&
+                                   active_session_id[0] != '\0' &&
+                                   strcmp(req_session_id, active_session_id) == 0);
+
             char request_id[64];
             snprintf(request_id, sizeof(request_id), "chatcmpl-%llu", ++req_counter);
 
-            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d\n",
-                    request_id, strlen(content), max_gen);
+            fprintf(stderr, "[serve] %s content=%zu chars, max_tokens=%d, session=%s%s\n",
+                    request_id, strlen(content), max_gen,
+                    has_session ? req_session_id : "(none)",
+                    is_continuation ? " [CONTINUE]" : " [NEW]");
 
-            // Tokenize
-            // System prompt is already cached — only tokenize the user turn
-            PromptTokens *pt = tokenize_user_turn(content);
+            // ---- Tokenize ----
+            // Continuation: prefix with <|im_end|>\n to close prior assistant turn
+            // New session: just the user turn (system prompt restored from snapshot)
+            PromptTokens *pt;
+            if (is_continuation) {
+                pt = tokenize_continuation_turn(content);
+            } else {
+                pt = tokenize_user_turn(content);
+            }
             if (!pt) {
                 http_write_str(client_fd,
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
@@ -5866,55 +5920,71 @@ static void serve_loop(
                 free(reqbuf); close(client_fd); continue;
             }
 
-            fprintf(stderr, "[serve] %s prompt=%d tokens\n", request_id, pt->count);
+            fprintf(stderr, "[serve] %s prompt=%d tokens%s\n", request_id, pt->count,
+                    is_continuation ? " (continuation — skipping snapshot restore)" : "");
 
-            // ---- Restore state from system prompt snapshot ----
-            // Instead of resetting to zero, restore to the cached system prompt state.
-            // This skips re-prefilling the system prompt tokens (~20 tokens, ~6s saved).
-            for (int i = 0; i < NUM_LAYERS; i++) {
-                if (kv_caches[i] && kv_snapshots[i].k_snapshot) {
-                    size_t sz = sys_prompt_len * kv_dim * sizeof(float);
-                    memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
-                    memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
-                    kv_caches[i]->len = kv_snapshots[i].len;
-                    // Also restore GPU KV mirror
-                    if (g_metal) {
-                        int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
-                        if (fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
-                            memcpy([g_metal->buf_kv_k[fa_idx] contents],
-                                   kv_snapshots[i].k_snapshot, sz);
-                            memcpy([g_metal->buf_kv_v[fa_idx] contents],
-                                   kv_snapshots[i].v_snapshot, sz);
-                        }
-                    }
-                } else if (kv_caches[i]) {
-                    kv_caches[i]->len = 0;
-                }
-                if (layer_states[i] && la_conv_snapshots[i]) {
-                    LinearAttnState *s = (LinearAttnState *)layer_states[i];
-                    memcpy(s->conv_state, la_conv_snapshots[i], conv_state_size);
-                    memcpy(s->ssm_state, la_ssm_snapshots[i], ssm_state_size);
-                } else if (layer_states[i]) {
-                    LinearAttnState *s = (LinearAttnState *)layer_states[i];
-                    memset(s->conv_state, 0, conv_state_size);
-                    memset(s->ssm_state, 0, ssm_state_size);
-                }
-            }
-            // Restore GPU delta-net state
-            if (g_metal && g_metal->delta_net_step) {
-                for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-                    if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
-                        memcpy([g_metal->buf_delta_state[i] contents],
-                               gpu_delta_snapshots[i], 64*128*128*sizeof(float));
-                    if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
-                        memcpy([g_metal->buf_conv_state[i] contents],
-                               gpu_conv_snapshots[i], 3*12288*sizeof(float));
-                }
+            int pos;
+            if (is_continuation) {
+                // ---- Continue from existing session state ----
+                // The KV caches + linear attention state already contain the full
+                // conversation history. Just set pos to where we left off.
+                pos = session_pos;
             } else {
-                reset_delta_net_state();
+                // ---- Restore state from system prompt snapshot ----
+                // Instead of resetting to zero, restore to the cached system prompt state.
+                // This skips re-prefilling the system prompt tokens (~20 tokens, ~6s saved).
+                for (int i = 0; i < NUM_LAYERS; i++) {
+                    if (kv_caches[i] && kv_snapshots[i].k_snapshot) {
+                        size_t sz = sys_prompt_len * kv_dim * sizeof(float);
+                        memcpy(kv_caches[i]->k_cache, kv_snapshots[i].k_snapshot, sz);
+                        memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
+                        kv_caches[i]->len = kv_snapshots[i].len;
+                        // Also restore GPU KV mirror
+                        if (g_metal) {
+                            int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
+                            if (fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+                                memcpy([g_metal->buf_kv_k[fa_idx] contents],
+                                       kv_snapshots[i].k_snapshot, sz);
+                                memcpy([g_metal->buf_kv_v[fa_idx] contents],
+                                       kv_snapshots[i].v_snapshot, sz);
+                            }
+                        }
+                    } else if (kv_caches[i]) {
+                        kv_caches[i]->len = 0;
+                    }
+                    if (layer_states[i] && la_conv_snapshots[i]) {
+                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                        memcpy(s->conv_state, la_conv_snapshots[i], conv_state_size);
+                        memcpy(s->ssm_state, la_ssm_snapshots[i], ssm_state_size);
+                    } else if (layer_states[i]) {
+                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
+                        memset(s->conv_state, 0, conv_state_size);
+                        memset(s->ssm_state, 0, ssm_state_size);
+                    }
+                }
+                // Restore GPU delta-net state
+                if (g_metal && g_metal->delta_net_step) {
+                    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
+                        if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
+                            memcpy([g_metal->buf_delta_state[i] contents],
+                                   gpu_delta_snapshots[i], 64*128*128*sizeof(float));
+                        if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
+                            memcpy([g_metal->buf_conv_state[i] contents],
+                                   gpu_conv_snapshots[i], 3*12288*sizeof(float));
+                    }
+                } else {
+                    reset_delta_net_state();
+                }
+                pos = sys_prompt_len;  // start after cached system prompt
+                // Update active session
+                if (has_session) {
+                    strncpy(active_session_id, req_session_id, sizeof(active_session_id) - 1);
+                    active_session_id[sizeof(active_session_id) - 1] = '\0';
+                } else {
+                    active_session_id[0] = '\0';
+                }
             }
             if (g_cache_telemetry_enabled) cache_telemetry_reset();
-            int pos = sys_prompt_len;  // start after cached system prompt
 
             // ---- Send SSE headers ----
             http_write_str(client_fd, SSE_HEADERS);
@@ -6036,6 +6106,14 @@ static void serve_loop(
             }
 
             sse_send_done(client_fd, request_id);
+
+            // ---- Save session state ----
+            // The KV caches + linear attention state already contain this conversation.
+            // Just record the position so the next request can continue from here.
+            session_pos = pos;
+            fprintf(stderr, "[serve] %s session_pos=%d (session=%s)\n",
+                    request_id, session_pos,
+                    active_session_id[0] ? active_session_id : "(none)");
 
             double gen_ms = now_ms() - t_gen;
             fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",

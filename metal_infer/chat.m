@@ -47,8 +47,16 @@ static int json_escape(const char *src, char *buf, int bufsize) {
     return j;
 }
 
+// Generate a simple session ID from pid + timestamp
+static void generate_session_id(char *buf, size_t bufsize) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    snprintf(buf, bufsize, "chat-%d-%ld%06d",
+             (int)getpid(), (long)tv.tv_sec, (int)tv.tv_usec);
+}
+
 // Connect to server, send POST, return socket fd (caller reads response)
-static int send_chat_request(int port, const char *user_message, int max_tokens) {
+static int send_chat_request(int port, const char *user_message, int max_tokens, const char *session_id) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
 
@@ -69,10 +77,18 @@ static int send_chat_request(int port, const char *user_message, int max_tokens)
     json_escape(user_message, escaped, sizeof(escaped));
 
     char body[MAX_INPUT_LINE * 3];
-    int body_len = snprintf(body, sizeof(body),
-        "{\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],"
-        "\"max_tokens\":%d,\"stream\":true}",
-        escaped, max_tokens);
+    int body_len;
+    if (session_id && session_id[0]) {
+        body_len = snprintf(body, sizeof(body),
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],"
+            "\"max_tokens\":%d,\"stream\":true,\"session_id\":\"%s\"}",
+            escaped, max_tokens, session_id);
+    } else {
+        body_len = snprintf(body, sizeof(body),
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],"
+            "\"max_tokens\":%d,\"stream\":true}",
+            escaped, max_tokens);
+    }
 
     // Build HTTP request
     char request[MAX_INPUT_LINE * 4];
@@ -218,13 +234,18 @@ int main(int argc, char **argv) {
         }
     }
 
+    // Generate session ID for conversation continuity
+    char session_id[64];
+    generate_session_id(session_id, sizeof(session_id));
+
     printf("==================================================\n");
     printf("  Qwen3.5-397B-A17B Chat (Flash-MoE Client)\n");
     printf("==================================================\n");
     printf("  Server:  http://localhost:%d\n", port);
     printf("  Tokens:  %d max per response\n", max_tokens);
     printf("  Think:   %s\n", show_thinking ? "visible (dimmed)" : "hidden");
-    printf("\n  Commands: /quit /exit\n");
+    printf("  Session: %s\n", session_id);
+    printf("\n  Commands: /quit /exit /clear\n");
     printf("==================================================\n\n");
 
     // Check server health
@@ -263,8 +284,14 @@ int main(int argc, char **argv) {
             printf("Goodbye.\n");
             break;
         }
+        if (strcmp(input_line, "/clear") == 0) {
+            // Generate a new session ID to force server to reset state
+            generate_session_id(session_id, sizeof(session_id));
+            printf("Session cleared. New session: %s\n\n", session_id);
+            continue;
+        }
 
-        sock = send_chat_request(port, input_line, max_tokens);
+        sock = send_chat_request(port, input_line, max_tokens, session_id);
         if (sock < 0) continue;
 
         printf("\n");
