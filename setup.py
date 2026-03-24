@@ -20,15 +20,11 @@ import sys
 import time
 
 REPO_URL = "https://github.com/cs01/flash-moe.git"
-DEFAULT_INSTALL_DIR = os.path.expanduser("~/flash-moe")
+PINNED_COMMIT = "b2c1784"
 
 
 def bootstrap():
-    """If we're not inside the repo, clone it and re-exec from there."""
-    marker = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "expert_index.json")
-    if os.path.exists(marker):
-        return os.path.dirname(os.path.abspath(sys.argv[0]))
-
+    """If we're not inside the repo, shallow-clone to /tmp and re-exec from there."""
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         if os.path.exists(os.path.join(script_dir, "expert_index.json")):
@@ -36,15 +32,27 @@ def bootstrap():
     except NameError:
         pass
 
-    print(f"\033[94m==>\033[0m \033[1mflash-moe repo not found locally, cloning...\033[0m")
-    install_dir = DEFAULT_INSTALL_DIR
-    if os.path.isdir(os.path.join(install_dir, ".git")):
-        print(f"  found existing clone at {install_dir}")
-    else:
-        subprocess.check_call(["git", "clone", REPO_URL, install_dir])
-        print(f"  cloned to {install_dir}")
+    marker = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "expert_index.json")
+    if os.path.exists(marker):
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
 
-    setup_script = os.path.join(install_dir, "setup.py")
+    import tempfile
+    clone_dir = os.path.join(tempfile.gettempdir(), "flash-moe-setup")
+
+    print(f"\033[94m==>\033[0m \033[1mcloning flash-moe to {clone_dir}...\033[0m")
+    if os.path.isdir(os.path.join(clone_dir, ".git")):
+        subprocess.check_call(["git", "-C", clone_dir, "fetch", "origin"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.check_call(["git", "clone", "--depth", "1", REPO_URL, clone_dir])
+
+    if PINNED_COMMIT != "WILL_BE_UPDATED":
+        subprocess.call(["git", "-C", clone_dir, "fetch", "--depth", "1", "origin", PINNED_COMMIT],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.call(["git", "-C", clone_dir, "checkout", PINNED_COMMIT],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    setup_script = os.path.join(clone_dir, "setup.py")
     os.execv(sys.executable, [sys.executable, setup_script] + sys.argv[1:])
 
 
