@@ -224,7 +224,7 @@ def setup_venv():
     status("creating python venv")
     subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
     subprocess.check_call([VENV_PYTHON, "-m", "pip", "install", "--quiet",
-                           "huggingface_hub[cli]", "numpy"])
+                           "huggingface_hub", "numpy"])
     success("venv created and dependencies installed")
 
 
@@ -239,7 +239,9 @@ def download_model(auto_yes):
     if not ask("start download?", auto_yes=auto_yes):
         sys.exit(0)
 
-    subprocess.check_call([VENV_PYTHON, "-m", "huggingface_hub", "download", HF_REPO_ID])
+    subprocess.check_call([VENV_PYTHON, "-c",
+        f"from huggingface_hub import snapshot_download; "
+        f"snapshot_download('{HF_REPO_ID}')"])
 
     model_path = find_model_path()
     if not model_path:
