@@ -24,7 +24,7 @@ PINNED_COMMIT = "b2c1784"
 
 
 def bootstrap():
-    """If we're not inside the repo, shallow-clone to /tmp and re-exec from there."""
+    """If we're not inside the repo, clone to ~/.flash-moe and re-exec from there."""
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         if os.path.exists(os.path.join(script_dir, "expert_index.json")):
@@ -36,8 +36,7 @@ def bootstrap():
     if os.path.exists(marker):
         return os.path.dirname(os.path.abspath(sys.argv[0]))
 
-    import tempfile
-    clone_dir = os.path.join(tempfile.gettempdir(), "flash-moe-setup")
+    clone_dir = os.path.expanduser("~/.flash-moe")
 
     print(f"\033[94m==>\033[0m \033[1mcloning flash-moe to {clone_dir}...\033[0m")
     if os.path.isdir(os.path.join(clone_dir, ".git")):
