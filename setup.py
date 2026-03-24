@@ -19,7 +19,36 @@ import subprocess
 import sys
 import time
 
-REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_URL = "https://github.com/cs01/flash-moe.git"
+DEFAULT_INSTALL_DIR = os.path.expanduser("~/flash-moe")
+
+
+def bootstrap():
+    """If we're not inside the repo, clone it and re-exec from there."""
+    marker = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "expert_index.json")
+    if os.path.exists(marker):
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if os.path.exists(os.path.join(script_dir, "expert_index.json")):
+            return script_dir
+    except NameError:
+        pass
+
+    print(f"\033[94m==>\033[0m \033[1mflash-moe repo not found locally, cloning...\033[0m")
+    install_dir = DEFAULT_INSTALL_DIR
+    if os.path.isdir(os.path.join(install_dir, ".git")):
+        print(f"  found existing clone at {install_dir}")
+    else:
+        subprocess.check_call(["git", "clone", REPO_URL, install_dir])
+        print(f"  cloned to {install_dir}")
+
+    setup_script = os.path.join(install_dir, "setup.py")
+    os.execv(sys.executable, [sys.executable, setup_script] + sys.argv[1:])
+
+
+REPO_DIR = bootstrap()
 METAL_DIR = os.path.join(REPO_DIR, "metal_infer")
 VENV_DIR = os.path.join(REPO_DIR, ".venv")
 VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
