@@ -68,17 +68,39 @@ On Apple Silicon, SSD DMA and GPU compute share the same memory controller and c
 
 ## Quick Start
 
+One command handles everything — downloads the model (~209GB), extracts weights, builds the engine:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cs01/flash-moe/main/setup.py | python3 -
+```
+
+Requires macOS with Apple Silicon and ~220GB free disk space. The script is idempotent — re-run it to resume if interrupted.
+
+Once setup completes, start the server and chat:
+
+```bash
+# Terminal 1: start the inference server
+cd metal_infer
+./infer --serve 8000
+
+# Terminal 2: interactive chat
+cd metal_infer
+./chat
+```
+
+The server exposes an OpenAI-compatible API at `http://localhost:8000/v1`, so you can use it with any tool that supports custom endpoints (opencode, continue, etc).
+
+### Manual Setup
+
+If you prefer to run each step yourself:
+
 ```bash
 cd metal_infer
 make
-# 4-bit inference (needs packed_experts/ directory)
 ./infer --prompt "Explain quantum computing" --tokens 100
 
 # 2-bit inference (faster but breaks tool calling)
 ./infer --prompt "Explain quantum computing" --tokens 100 --2bit
-
-# Interactive chat with tool calling
-./chat
 
 # Per-layer timing breakdown
 ./infer --prompt "Hello" --tokens 20 --timing
