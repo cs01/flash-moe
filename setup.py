@@ -66,6 +66,8 @@ HF_SNAPSHOT = "39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 
 MODEL_WEIGHTS_BIN = os.path.join(METAL_DIR, "model_weights.bin")
 MODEL_WEIGHTS_JSON = os.path.join(METAL_DIR, "model_weights.json")
+TOKENIZER_BIN = os.path.join(METAL_DIR, "tokenizer.bin")
+VOCAB_BIN = os.path.join(METAL_DIR, "vocab.bin")
 EXPERT_INDEX = os.path.join(REPO_DIR, "expert_index.json")
 INFER_BIN = os.path.join(METAL_DIR, "infer")
 CHAT_BIN = os.path.join(METAL_DIR, "chat")
@@ -203,14 +205,28 @@ def check_platform():
 
 def check_disk_space(auto_yes):
     free = free_space_gb(REPO_DIR)
-    if free < REQUIRED_SPACE_GB:
+    model_path = find_model_path()
+    already_downloaded = model_path is not None
+    packed = count_packed_layers(model_path) if model_path else 0
+    remaining_gb = (NUM_LAYERS - packed) * LAYER_SIZE / (1024 ** 3)
+
+    if already_downloaded and packed > 0:
+        needed = remaining_gb + 10
+        if free < needed:
+            warn(f"{free:.0f} GB free, need ~{needed:.0f} GB for {NUM_LAYERS - packed} remaining layers")
+            if not ask("continue? (cleanup mode can help)", auto_yes=auto_yes):
+                sys.exit(1)
+        else:
+            success(f"{free:.0f} GB free — enough for remaining work")
+    elif already_downloaded:
+        success(f"model already downloaded, {free:.0f} GB free")
+    elif free < REQUIRED_SPACE_GB:
         error(f"need ~{REQUIRED_SPACE_GB} GB free, only {free:.0f} GB available")
         error("the model download alone is ~209 GB")
-        if not ask("continue anyway? (will likely fail)", default_yes=False, auto_yes=auto_yes):
+        if not ask("continue anyway?", default_yes=False, auto_yes=auto_yes):
             sys.exit(1)
     elif free < TIGHT_SPACE_GB:
         warn(f"{free:.0f} GB free — tight but workable")
-        warn("after download + repack you'll need ~418 GB temporarily")
         warn("the script can delete HF cache shards as it repacks to stay in budget")
     else:
         success(f"{free:.0f} GB free — plenty of room")
@@ -281,6 +297,47 @@ def extract_weights(model_path):
         "--output", METAL_DIR,
     ])
     success("non-expert weights extracted")
+
+
+def export_tokenizer(model_path):
+    if os.path.exists(TOKENIZER_BIN) and os.path.exists(VOCAB_BIN):
+        success("tokenizer.bin and vocab.bin already exist")
+        return
+
+    tokenizer_json = os.path.join(model_path, "tokenizer.json")
+    if not os.path.exists(tokenizer_json):
+        error(f"tokenizer.json not found at {tokenizer_json}")
+        sys.exit(1)
+
+    status("exporting tokenizer.bin and vocab.bin")
+
+    subprocess.check_call([
+        VENV_PYTHON,
+        os.path.join(METAL_DIR, "export_tokenizer.py"),
+        tokenizer_json,
+        TOKENIZER_BIN,
+    ])
+
+    with open(tokenizer_json, "r", encoding="utf-8") as f:
+        t = json.load(f)
+    vocab = t["model"]["vocab"]
+    added = {tok["content"]: tok["id"] for tok in t["added_tokens"]}
+    all_tokens = {**vocab, **added}
+    max_id = max(all_tokens.values())
+    num_entries = max_id + 1
+
+    with open(VOCAB_BIN, "wb") as f:
+        f.write(struct.pack("<I", num_entries))
+        f.write(struct.pack("<I", max_id))
+        by_id = {v: k for k, v in all_tokens.items()}
+        for i in range(num_entries):
+            token_str = by_id.get(i, "")
+            b = token_str.encode("utf-8")
+            f.write(struct.pack("<H", len(b)))
+            if b:
+                f.write(b)
+
+    success(f"exported tokenizer.bin + vocab.bin ({num_entries} tokens)")
 
 
 def repack_experts(model_path, auto_yes):
@@ -366,7 +423,14 @@ def repack_with_cleanup(model_path, layers, pe_dir):
         for fname, needed_by in shard_to_layers.items():
             if needed_by.issubset(completed_layers):
                 shard_path = os.path.join(model_path, fname)
-                if os.path.exists(shard_path):
+                if os.path.islink(shard_path):
+                    blob_path = os.path.realpath(shard_path)
+                    if os.path.exists(blob_path):
+                        size_mb = os.path.getsize(blob_path) / (1024 ** 2)
+                        os.remove(blob_path)
+                        os.remove(shard_path)
+                        print(f"    deleted {fname} ({size_mb:.0f} MB) — no longer needed")
+                elif os.path.exists(shard_path):
                     size_mb = os.path.getsize(shard_path) / (1024 ** 2)
                     os.remove(shard_path)
                     print(f"    deleted {fname} ({size_mb:.0f} MB) — no longer needed")
@@ -415,6 +479,13 @@ def verify():
         error("packed_experts/layer_00.bin not found")
         return False
 
+    if not os.path.exists(os.path.join(METAL_DIR, "tokenizer.bin")):
+        error("tokenizer.bin not found")
+        return False
+    if not os.path.exists(os.path.join(METAL_DIR, "vocab.bin")):
+        error("vocab.bin not found")
+        return False
+
     success("all files in place")
     return True
 
@@ -436,16 +507,19 @@ def main():
     model_path = download_model(auto_yes)
     update_expert_index(model_path)
     extract_weights(model_path)
+    export_tokenizer(model_path)
     repack_experts(model_path, auto_yes)
     build()
 
     if verify():
         print(f"\n{GREEN}{BOLD}setup complete!{RESET}\n")
-        print(f"  run the model:")
+        print(f"  start the server:")
+        print(f"    cd {METAL_DIR}")
+        print(f"    ./infer --serve 8000")
+        print(f"\n  then in another terminal:")
         print(f"    cd {METAL_DIR}")
         print(f"    ./chat")
-        print(f"\n  or one-shot:")
-        print(f"    ./infer --prompt \"hello\" --tokens 100\n")
+        print(f"\n  OpenAI-compatible API at http://localhost:8000/v1\n")
     else:
         print(f"\n{RED}setup incomplete — check errors above{RESET}")
         sys.exit(1)
